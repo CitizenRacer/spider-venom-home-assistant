@@ -1,11 +1,15 @@
 {
   "domain": "spider_venom",
   "name": "Spider Grills Venom",
-  "codeowners": ["@brannonjames"],
+  "codeowners": [
+    "@brannonjames"
+  ],
   "config_flow": true,
-  "documentation": "https://github.com/brannonjames/spider-venom-home-assistant",
+  "documentation": "https://github.com/CitizenRacer/spider-venom-home-assistant",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/brannonjames/spider-venom-home-assistant/issues",
-  "requirements": [],
-  "version": "0.2.0"
+  "requirements": [
+    "paho-mqtt>=2.1.0"
+  ],
+  "version": "0.2.1"
 }

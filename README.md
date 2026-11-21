@@ -13,6 +13,12 @@ The integration does not store your Spider Grills password or access token after
 - Power, engaged, paused, and high-temperature mode controls.
 - Target temperature number entity and service.
 
+## AWS IoT transport compatibility (fork v0.2.1)
+
+This fork includes the MQTT-over-WebSocket workaround from [upstream issue #3](https://github.com/brannonjames/spider-venom-home-assistant/issues/3). Since September 30, 2026, AWS IoT HTTPS shadow read/write requests using guest Cognito credentials have returned HTTP 403. The patched client uses SigV4-signed MQTT over secure WebSockets to read and update the shadow instead.
+
+The workaround creates a fresh MQTT connection per refresh. At the default 30-second polling interval, that is approximately 2,880 connections/day, including while the grill is offline. If you want to reduce traffic, disable the integration's automatic polling under System options and trigger refreshes only while the grill is online. Shadow data may be stale while the grill is off; do not treat an old reported temperature as live.
+
 ## Installation
 
 ### HACS
@@ -20,7 +26,7 @@ The integration does not store your Spider Grills password or access token after
 In HACS, add this repository as a custom repository with category `Integration`, then install it from HACS:
 
 ```text
-https://github.com/brannonjames/spider-venom-home-assistant
+https://github.com/CitizenRacer/spider-venom-home-assistant
 ```
 
 Restart Home Assistant after installation, then add `Spider Grills Venom` from Settings -> Devices & services.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
@@ -9,12 +10,17 @@ import hmac
 import json
 import logging
 import socket
+import ssl
+import threading
 from typing import Any
 from urllib.parse import quote
+import uuid
 
 from aiohttp import ClientConnectorError, ClientError, ClientSession
+import paho.mqtt.client as mqtt
 
 _LOGGER = logging.getLogger(__name__)
+_MQTT_TIMEOUT = 15
 _REDACTED_KEYS = {
     "accesskeyid",
     "accesstoken",
@@ -82,51 +88,97 @@ class SpiderVenomClient:
         return await self.async_get_shadow()
 
     async def _async_iot_shadow_request(self, *, method: str, payload: str) -> dict[str, Any]:
-        """Call the AWS IoT thing shadow endpoint."""
+        """Call the AWS IoT thing shadow over MQTT-over-WebSocket.
+
+        Since 2026-09-30 the guest Cognito role gets 403 on the HTTP shadow API but
+        still has MQTT access, which is the transport the official app uses.
+        """
         credentials = await self._async_get_credentials()
-        path = f"/things/{quote(self._thing_name, safe='')}/shadow"
-        url = f"https://{self._endpoint}{path}"
-        headers = self._signed_headers(
-            method=method,
-            path=path,
-            query_string="",
-            payload=payload,
-            credentials=credentials,
-            service="iotdata",
+        action = "get" if method == "GET" else "update"
+        token = uuid.uuid4().hex
+        message = json.loads(payload) if payload else {}
+        message["clientToken"] = token
+        return await asyncio.get_running_loop().run_in_executor(
+            None,
+            self._mqtt_shadow_call,
+            self._presigned_ws_path(credentials),
+            action,
+            json.dumps(message, separators=(",", ":")),
+            token,
         )
-        if payload:
-            headers["Content-Type"] = "application/json"
 
+    def _mqtt_shadow_call(
+        self, ws_path: str, action: str, message: str, token: str
+    ) -> dict[str, Any]:
+        topic = f"$aws/things/{self._thing_name}/shadow/{action}"
+        done = threading.Event()
+        result: dict[str, Any] = {}
+
+        def finish(key: str, value: Any) -> None:
+            if not done.is_set():
+                result[key] = value
+                done.set()
+
+        def on_connect(client, userdata, flags, reason_code, properties=None):
+            if reason_code.is_failure:
+                finish("error", f"MQTT connect refused: {reason_code}")
+                return
+            client.subscribe([(f"{topic}/accepted", 1), (f"{topic}/rejected", 1)])
+
+        def on_subscribe(client, userdata, mid, reason_codes, properties=None):
+            if any(code.is_failure for code in reason_codes):
+                finish("error", f"MQTT subscribe refused: {[str(c) for c in reason_codes]}")
+                return
+            client.publish(topic, message, qos=1)
+
+        def on_message(client, userdata, msg):
+            try:
+                doc = json.loads(msg.payload)
+            except ValueError:
+                return
+            # accepted/rejected topics are shared with the vendor app; match our request.
+            if not isinstance(doc, dict) or doc.get("clientToken") != token:
+                return
+            _log_response_body(f"IoT shadow {action}", 200, msg.payload.decode())
+            if msg.topic.endswith("/rejected"):
+                finish("error", f"Shadow {action} rejected: {doc.get('code')} {doc.get('message')}")
+            else:
+                finish("doc", doc)
+
+        def on_disconnect(client, userdata, flags, reason_code, properties=None):
+            finish("error", f"MQTT disconnected: {reason_code}")
+
+        # The vendor's IoT policy only admits a dashed-UUID client id; the Cognito
+        # identity id or an undashed hex UUID is disconnected before CONNACK.
+        client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id=str(uuid.uuid4()),
+            transport="websockets",
+        )
+        client.ws_set_options(path=ws_path)
+        client.tls_set_context(ssl.create_default_context())
+        client.on_connect = on_connect
+        client.on_subscribe = on_subscribe
+        client.on_message = on_message
+        client.on_disconnect = on_disconnect
         try:
-            async with self._session.request(
-                method, url, headers=headers, data=payload or None
-            ) as response:
-                body = await response.text()
-                _log_response_body(f"IoT shadow {method}", response.status, body)
-        except ClientConnectorError as err:
+            client.connect(self._endpoint, 443, keepalive=30)
+        except (OSError, ssl.SSLError) as err:
             raise SpiderVenomApiError(
-                f"IoT shadow request could not connect to {self._endpoint}: {err}"
+                f"IoT MQTT could not connect to {self._endpoint}: {err}"
             ) from err
-        except (TimeoutError, socket.gaierror) as err:
-            raise SpiderVenomApiError(
-                f"IoT shadow request timed out or DNS failed for {self._endpoint}: {err}"
-            ) from err
-        except ClientError as err:
-            raise SpiderVenomApiError(f"IoT shadow request failed: {err}") from err
 
-        if response.status != 200:
-            raise SpiderVenomApiError(
-                f"IoT shadow request returned HTTP {response.status}: {body[:300]}"
-            )
-
+        client.loop_start()
         try:
-            parsed = json.loads(body)
-        except json.JSONDecodeError as err:
-            raise SpiderVenomApiError("IoT shadow response was not JSON") from err
+            if not done.wait(_MQTT_TIMEOUT):
+                raise SpiderVenomApiError(f"IoT shadow {action} timed out after {_MQTT_TIMEOUT}s")
+        finally:
+            client.disconnect()
+            client.loop_stop()
 
-        if not isinstance(parsed, dict):
-            raise SpiderVenomApiError("IoT shadow response had an unexpected shape")
-        return parsed
+        if "error" in result:
+            raise SpiderVenomApiError(result["error"])
+        return result["doc"]
 
     async def _async_get_credentials(self) -> _Credentials:
         if self._credentials is not None and not self._credentials.expires_soon:
@@ -199,33 +251,31 @@ class SpiderVenomClient:
             raise SpiderVenomApiError(f"Cognito {target} response had an unexpected shape")
         return parsed
 
-    def _signed_headers(
-        self,
-        *,
-        method: str,
-        path: str,
-        query_string: str,
-        payload: str,
-        credentials: _Credentials,
-        service: str,
-    ) -> dict[str, str]:
+    def _presigned_ws_path(self, credentials: _Credentials) -> str:
         now = datetime.now(UTC)
         amz_date = now.strftime("%Y%m%dT%H%M%SZ")
         date_stamp = now.strftime("%Y%m%d")
-        payload_hash = hashlib.sha256(payload.encode()).hexdigest()
-
-        headers = {
-            "host": self._endpoint,
-            "x-amz-date": amz_date,
-            "x-amz-security-token": credentials.session_token,
-        }
-        signed_headers = ";".join(sorted(headers))
-        canonical_headers = "".join(f"{key}:{headers[key]}\n" for key in sorted(headers))
-        canonical_request = "\n".join(
-            [method, path, query_string, canonical_headers, signed_headers, payload_hash]
-        )
-
+        service = "iotdevicegateway"
         credential_scope = f"{date_stamp}/{self._region}/{service}/aws4_request"
+        query = {
+            "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+            "X-Amz-Credential": f"{credentials.access_key_id}/{credential_scope}",
+            "X-Amz-Date": amz_date,
+            "X-Amz-SignedHeaders": "host",
+        }
+        query_string = "&".join(
+            f"{key}={quote(value, safe='')}" for key, value in sorted(query.items())
+        )
+        canonical_request = "\n".join(
+            [
+                "GET",
+                "/mqtt",
+                query_string,
+                f"host:{self._endpoint}\n",
+                "host",
+                hashlib.sha256(b"").hexdigest(),
+            ]
+        )
         string_to_sign = "\n".join(
             [
                 "AWS4-HMAC-SHA256",
@@ -239,16 +289,11 @@ class SpiderVenomClient:
             string_to_sign.encode(),
             hashlib.sha256,
         ).hexdigest()
-
-        return {
-            "Authorization": (
-                "AWS4-HMAC-SHA256 "
-                f"Credential={credentials.access_key_id}/{credential_scope}, "
-                f"SignedHeaders={signed_headers}, Signature={signature}"
-            ),
-            "x-amz-date": amz_date,
-            "x-amz-security-token": credentials.session_token,
-        }
+        # AWS IoT expects the session token appended after signing, not signed.
+        return (
+            f"/mqtt?{query_string}&X-Amz-Signature={signature}"
+            f"&X-Amz-Security-Token={quote(credentials.session_token, safe='')}"
+        )
 
     def _signing_key(self, secret_key: str, date_stamp: str, service: str) -> bytes:
         key_date = hmac.new(("AWS4" + secret_key).encode(), date_stamp.encode(), hashlib.sha256).digest()
